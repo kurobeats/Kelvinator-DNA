@@ -1,471 +1,498 @@
-# Kelvinator DNA Protocol Specification
+# Broadlink DNA Protocol Reference
 
-> Reverse-engineered from the Kelvinator Home Comfort app (APK),
-> libNetworkAPI.so (Ghidra analysis), and MITM traffic captures.
-
----
-
-## 1. System Architecture
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                   Kelvinator Mobile App                       │
-│  ┌──────────────────────────────────────────────────────────┐ │
-│  │  Java/Kotlin UI Layer                                     │ │
-│  │  cn.com.broadlink.networkapi.NetworkAPI                   │ │
-│  │    └─ public native dnaControl(String, String, String,   │ │
-│  │         String, String) : String                          │ │
-│  └───────────────────────┬──────────────────────────────────┘ │
-│                          │ JNI                                │
-│  ┌───────────────────────▼──────────────────────────────────┐ │
-│  │  libNetworkAPI.so (ARM64/ARM native)                      │ │
-│  │  ┌─────────────────────────────────────────────────────┐ │ │
-│  │  │  Entry points (JNI exports):                        │ │ │
-│  │  │  • SDKInit     — Initialize library, load config    │ │ │
-│  │  │  • dnaControl  — Main AC control function           │ │ │
-│  │  │  • deviceProbe — Discover devices on LAN            │ │ │
-│  │  │  • devicePair  — Pair with new device               │ │ │
-│  │  │  • deviceProfile — Get device capabilities          │ │ │
-│  │  │  • deviceStatusOnServer — Cloud status query        │ │ │
-│  │  └─────────────────────────────────────────────────────┘ │ │
-│  │  ┌─────────────────────────────────────────────────────┐ │ │
-│  │  │  Internal functions:                                 │ │ │
-│  │  │  • networkapi_dna_control  — DNA protocol impl      │ │ │
-│  │  │  • bl_data_pack           — Build DNA packets       │ │ │
-│  │  │  • bl_data_tfb_encrypt    — TFB + AES encrypt       │ │ │
-│  │  │  • bl_data_tfb_decrypt    — TFB + AES decrypt       │ │ │
-│  │  │  • bl_tfb_checksum        — Compute packet checksum │ │ │
-│  │  │  • bl_sdk_tfb_encode      — TFB serialization       │ │ │
-│  │  │  • bl_sdk_tfb_decode      — TFB deserialization     │ │ │
-│  │  │  • bl_checksum            — Simple byte sum         │ │ │
-│  │  └─────────────────────────────────────────────────────┘ │ │
-│  │  ┌─────────────────────────────────────────────────────┐ │ │
-│  │  │  Embedded mbedTLS fork (all functions prefixed      │ │ │
-│  │  │  "broadlink_"):                                      │ │ │
-│  │  │  • AES-128-ECB  (broadlink_cipher_*)                 │ │ │
-│  │  │  • MD5          (broadlink_md5)                      │ │ │
-│  │  │  • SHA1         (broadlink_sha1)                     │ │ │
-│  │  │  • ECDH         (broadlink_ecdh_*)                   │ │ │
-│  │  │  • ECDSA        (broadlink_ecdsa_*)                  │ │ │
-│  │  │  • CTR_DRBG     (broadlink_ctr_drbg_*)              │ │ │
-│  │  │  • X.509        (broadlink_x509_*)                  │ │ │
-│  │  └─────────────────────────────────────────────────────┘ │ │
-│  │  ┌─────────────────────────────────────────────────────┐ │ │
-│  │  │  Embedded Lua VM (broadlink_bvm_*):                  │ │ │
-│  │  │  • Script file execution for device profiles         │ │ │
-│  │  │  • cJSON integration (BLJSON_*)                      │ │ │
-│  │  │  • API bridge (broadlink_api_lib)                    │ │ │
-│  │  └─────────────────────────────────────────────────────┘ │ │
-│  └──────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────┘
-     │                          │
-     │ HTTPS (Cloud API)        │ UDP (Local Network)
-     ▼                          ▼
-┌──────────────┐     ┌──────────────────┐
-│ BroadLink     │     │  Kelvinator AC   │
-│ Cloud Server  │     │  (a0:43:b0:xx)  │
-│ ibroadlink.com│     │  Port 80/UDP    │
-└──────────────┘     └──────────────────┘
-```
+Reverse-engineered from `libNetworkAPI.so` v2.0.49-6566c07.
 
 ---
 
-## 2. Layer 1: Cloud API (HTTPS)
-
-### 2.1 Endpoints
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/ec4/v1/common/api` | Get API key (initial handshake) |
-| POST | `/ec4/v1/user/getfamilyid` | Get family/home ID |
-| POST | `/ec4/v1/family/getallinfo` | Get all devices with AES keys |
-| POST | `/data/v1/appdata/upload?source=app&datatype=app_user_v1` | Upload analytics |
-
-### 2.2 Authentication Flow
+## 1. Architecture Overview
 
 ```
-1. GET /ec4/v1/common/api
-   Headers: system, appPlatform, language, timestamp
-   Response: {"error":0, "key":"<32-char hex API key>", "timestamp":"..."}
-
-2. POST /ec4/v1/user/getfamilyid
-   Headers: Content-type: application/x-java-serialized-object
-            loginsession, lid (license ID), userid, token, timestamp
-   Body: Java ObjectOutputStream (encrypted parameters)
-   Response: {"error":0, "familyinfo": [{"id":"<family ID>", "familyname":"...", ...}]}
-
-3. POST /ec4/v1/family/getallinfo
-   Headers: Same as above
-   Body: Java ObjectOutputStream (encrypted parameters)
-   Response: {"error":0, "familyallinfo": [{...rooms, devices, AES keys...}]}
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Android Application                              │
+│  cn.com.broadlink.networkapi.NetworkAPI                                 │
+└────────────────────────────┬────────────────────────────────────────────┘
+                             │ JNI
+┌────────────────────────────▼────────────────────────────────────────────┐
+│  libNetworkAPI.so  (this document)                                      │
+│                                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                  │
+│  │ JNI Wrappers │  │ Internal API │  │  Network I/O  │                  │
+│  │ (JavaString  │──│ (networkapi_ │──│  (delegated   │                  │
+│  │  ↔ char*)    │  │  *_functions)│  │   to Java)    │                  │
+│  └──────────────┘  └──────────────┘  └──────────────┘                  │
+│                                            │                            │
+│  ┌──────────────┐  ┌──────────────┐       │                            │
+│  │  BLJSON      │  │  Crypto      │       │                            │
+│  │  (cJSON fork)│  │  (AES-128)   │       │                            │
+│  └──────────────┘  └──────────────┘       │                            │
+└───────────────────────────────────────────│────────────────────────────┘
+                                            │ callbacks
+┌───────────────────────────────────────────▼────────────────────────────┐
+│  Java-side Network Transport                                            │
+│  (OkHttp / HttpURLConnection → Broadlink Cloud API)                     │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.3 Credential Identifiers
+### Key Insight
 
-| Field | Format | Example | Purpose |
-|-------|--------|---------|---------|
-| License ID (lid) | 32 hex chars | `bddb4af53f74edaa03b1aa439b75e7a6` | OEM installation ID |
-| User ID | 32 hex chars | `0086942d0b76d306304d4a456f31fb89` | User account ID |
-| Login Session | 32 hex chars | `9cd307d65e7d7b09307dd2d5ee37da92` | Session token |
-| Token | 32 hex chars | `b5a5a37681b1d119f0b1fdeb4e76aecd` | Per-request auth token |
-| API Key | 32 hex chars | `f67c1f5d283e774825a625e893ad9314` | Returned from handshake |
-| Family ID | 32 hex chars | `011652d007852ee4a8bb9e5288bbeaee` | Home/family identifier |
-| Device ID (DID) | 34 hex chars | `00000000000000000000a043b036bff4` | Device unique ID |
-| AES Key | 32 hex chars | `99293543659c5b0caf659134ead8817f` | Per-device AES-128 key |
-| Password | 32-bit integer | `754770058` | Device auth password |
+The library contains **zero socket code** for cloud communication. All network I/O is done via Java callbacks (`setNetworkCallback`). The library only handles:
 
-### 2.4 Device Information (from getallinfo)
-
-```json
-{
-  "familyallinfo": [{
-    "devinfo": [{
-      "did": "00000000000000000000a043b036bff4",
-      "mac": "a0:43:b0:36:bf:f4",
-      "password": 754770058,
-      "devtype": 20379,
-      "pid": "0000000000000000000000009b4f0000",
-      "name": "master bedroom aircon",
-      "aeskey": "99293543659c5b0caf659134ead8817f",
-      "terminalid": 1,
-      "subdevicenum": 0
-    }]
-  }]
-}
-```
+- JSON parsing/construction (via BLJSON, a cJSON fork)
+- AES-128-CBC encryption/decryption
+- Device discovery protocol (UDP broadcast on port 80)
+- Device pairing handshake
+- PID-based product profile loading
+- EasyConfig SmartConfig WiFi provisioning
+- Sunrise/sunset calculation
 
 ---
 
-## 3. Layer 2: DNA Protocol (UDP)
+## 2. JNI Entry Points
 
-### 3.1 Transport
+### 2.1 Function Calling Convention
 
-- **Protocol**: UDP (connectionless)
-- **Device Port**: 80 (UDP)
-- **Direction**: Bidirectional (client ↔ device)
-- **MTU**: ~1024 bytes (DNA_MAX_PAYLOAD)
-- **Timeout**: 5 seconds recommended
-- **Retries**: 3 recommended
-
-### 3.2 Packet Format
+Every JNI entry point follows the same pattern:
 
 ```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|     Magic     |     Magic     |          Payload Len           |
-|    0x5a      |    0xa5      |         (little-endian)         |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|   Command Hi  |   Command Lo  |                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               |
-|                                                               |
-|                    Payload (variable length)                  |
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|           Checksum            |
-|         (big-endian)          |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+Java_cn_com_broadlink_networkapi_NetworkAPI_<Method>
+  → GetStringUTFChars on each jstring argument
+  → Call internal networkapi_* function
+  → NewStringUTF on the return value
+  → ReleaseStringUTFChars on each argument
 ```
 
-- **Magic**: `0x5A 0xA5` (2 bytes) — packet start marker
-- **Payload Length**: Little-endian uint16 (2 bytes) — length of payload + checksum
-- **Command**: Big-endian uint16 (2 bytes) — command identifier
-- **Payload**: Variable length bytes (encrypted or plain)
-- **Checksum**: Big-endian uint16 (2 bytes) — sum of all payload bytes mod 65536
+### 2.2 Complete Export List
 
-### 3.3 Command IDs
+| Address | Symbol | Internal Call |
+|---------|--------|---------------|
+| `0x0011bf80` | `Java_..._SDKInit` | `networkapi_init` |
+| `0x0011c130` | `Java_..._bl_1sdk_1auth` | `networkapi_sdk_auth` (13 params) |
+| `0x0011cd10` | `Java_..._deviceBindWithServer` | `networkapi_device_bind` |
+| `0x0011ce70` | `Java_..._deviceStatusOnServer` | `networkapi_device_devicestatus` |
+| `0x0011cfd0` | `Java_..._bl_1easyconfig` | `networkapi_device_easyconfig` |
+| `0x0011d0c0` | `Java_..._LicenseInfo` | `networkapi_license_info` |
+| `0x0011d1b0` | `Java_..._SDKInit` | `networkapi_init` |
+| `0x0011d2a0` | `Java_..._deviceEasyConfigCancel` | `networkapi_device_easyconfig_cancel` |
+| `0x0011d330` | `Java_..._deviceGetAPList` | `networkapi_device_get_aplist` |
+| `0x0011d420` | `Java_..._deviceAPConfig` | `networkapi_device_apconfig` |
+| `0x0011d510` | `Java_..._deviceRedCodeInfomation` | `networkapi_red_code_information` |
+| `0x0011d600` | `Java_..._deviceRedCodeData` | `networkapi_red_code_data` |
+| `0x0011d6f0` | `Java_..._deviceProbe` | `networkapi_device_probe` |
+| `0x0011d7e0` | `Java_..._deviceGetResourcesToken` | `networkapi_device_resources_token` |
+| `0x0011d940` | `Java_..._devicePair` | `networkapi_device_pair` |
+| `0x0011daa0` | `Java_..._deviceProfile` | `networkapi_device_profile` |
+| `0x0011dc60` | `Java_..._deviceProfile2` | `networkapi_pid_profile` |
+| `0x0011ddc0` | `Java_..._dnaControl` | `networkapi_dna_control` |
+| `0x0011dff0` | `Java_..._deviceSubControlTranslate` | `networkapi_gateway_translate` |
+| `0x0011e1b0` | `Java_..._calculateSunriseSunset` | `networkapi_sunrise_sunset` |
+| `0x0011e2a0` | `Java_..._setNetworkCallback` | Stores Java callback ref |
+| `0x0011e540` | `Java_..._setIRCodeCallback` | Stores Java callback ref |
+| `0x0011e7e0` | `Java_..._setDeviceControlCallback` | Stores Java callback ref |
 
-| Command | Value | Description |
-|---------|-------|-------------|
-| HEARTBEAT | `0x0000` | Keep-alive / no-op |
-| DEVICE_DISCOVER | `0x0001` | LAN device discovery probe |
-| DEVICE_INFO | `0x0002` | Query device information |
-| DEVICE_PAIR | `0x0003` | Pair with new device |
-| DEVICE_BIND | `0x0004` | Bind device to account |
-| FIRMWARE_UPDATE | `0x000E` | OTA firmware update |
-| AUTH_REQUEST | `0x0065` | Authentication request |
-| AUTH_RESPONSE | `0x0066` | Authentication response |
-| DEVICE_CONTROL | `0x006A` | Send control command |
-| DEVICE_STATUS | `0x006B` | Query device status |
-| DEVICE_SUB_CONTROL | `0x006C` | Sub-device control |
+### 2.3 Callback Mechanism
+
+The library uses a global singleton structure at `0x00228698` (the "DNA SDK context"):
+
+```
+Offset  Type    Description
+------  ----    -----------
+0x00    8*N     pthread_rwlock_t (rwlock)
+0x40    8*N     network_callback JNI global ref
+0x48    8*N     ir_code_callback JNI global ref
+0x50    8*N     device_control_callback JNI global ref
+0x58    8       cookie_string_ptr
+0x60    8       cookie_string_ptr
+...
+0xB0    1       local_ctrl_override (bool)
+0xB2    1       sdk_init_called (bool)
+0xB3    1       log_level (0-3)
+...
+0x2F0   386     filepath buffer (script directory)
+```
+
+Callback functions acquire the lock via `pthread_rwlock_rdlock`, call the Java method with `CallObjectMethod`, and release.
+
+### 2.4 Global Data Tables
+
+The library stores server URLs and endpoint paths in data tables at runtime:
+
+| Address | Content |
+|---------|---------|
+| `0x00232c88` | `device_config` endpoint ref |
+| `0x00232c90` | `server_config` ref |
+| `0x00232c98` | `write_config` endpoint ref |
+| `0x00232ca0` | `ac_ircode` endpoint ref |
+| `0x00232ca8` | `server_config_2` ref |
+| `0x00232cb0` | `ircode` endpoint ref |
+| `0x00232cb8` | `remote_control` endpoint ref |
+| `0x00232cc0` | `server_config_3` ref |
+| `0x00232cc8` | JVM pointer (obtained from `GetJavaVM`) |
+| `0x00232cd0` | JNI lock flag |
 
 ---
 
-## 4. Layer 3: AES-128-ECB Encryption
+## 3. Device Discovery Protocol (UDP)
 
-### 4.1 Algorithm
+### 3.1 Discovery Packet (Probe)
 
-- **Cipher**: AES-128
-- **Mode**: ECB (Electronic Codebook)
-- **Padding**: PKCS#7
-- **Key**: 16-byte per-device AES key (from cloud API)
-
-### 4.2 Pre-encryption XOR
-
-Before AES encryption, the first 16 bytes of the plaintext are XOR'd with
-a key derived from the device password:
+Sent to `255.255.255.255:80` (UDP broadcast):
 
 ```
-xor_key = repeat(password_bytes, 16)  # password is big-endian uint32
-for i in range(min(len(plaintext), 16)):
-    plaintext[i] ^= xor_key[i]
+Offset  Size  Value / Description
+──────  ────  ───────────────────
+0x00    4     System timestamp (u32, little-endian)
+0x04    4     Local IP address (u32, little-endian) — e.g. 192.168.1.100 = 0x6401A8C0
+0x08    2     Local UDP source port
+0x0A    38    Zero padding
+──────────────────────────────────
+Total: 48 bytes
 ```
 
-### 4.3 Encryption Flow
+### 3.2 Discovery Response
+
+Received from device (unicast UDP):
 
 ```
-plaintext (TFB encoded)
-    │
-    ├─→ XOR first 16 bytes with password-derived key
-    │
-    ├─→ PKCS#7 pad to 16-byte boundary
-    │
-    ├─→ AES-128-ECB encrypt
-    │
-    ▼
-ciphertext (for DNA packet payload)
-```
-
-### 4.4 Decryption Flow
-
-```
-ciphertext (from DNA packet payload)
-    │
-    ├─→ AES-128-ECB decrypt
-    │
-    ├─→ Remove PKCS#7 padding
-    │
-    ├─→ XOR first 16 bytes with password-derived key
-    │
-    ▼
-plaintext (TFB encoded)
+Offset  Size  Description
+──────  ────  ───────────────────
+0x00    2     Payload length (little-endian u16)
+0x02    2     Reserved
+0x04    4     Device type (u32 LE):
+                0x0000 = SP1
+                0x2711 = SP2
+                0x947A = SP3
+                0x9479 = SP3S
+                0x2222 = SP4L
+                0x2712 = RM2
+                0x51DA = RM4
+                0x2737 = RM Mini
+                0x2714 = A1
+                0x4EB5 = MP1
+                0x4EAD = SC1
+                0x4EAF = Hysen
+0x08    2     Command (0x6A = 106)
+0x0A    2     Packet count
+0x0C    4     Device ID (u32 LE)
+0x10    6     MAC address (raw bytes)
+0x16    2     Padding
+0x18    4     Device ID copy
+0x1C    4     IP address (network byte order / raw bytes)
+0x20    16    Additional data / padding
+──────────────────────────────────
+Total: 48 bytes (0x30)
 ```
 
 ---
 
-## 5. Layer 4: TFB (Type-Field-Body) Serialization
+## 4. Device Command Protocol (UDP)
 
-### 5.1 Overview
+### 4.1 Packet Structure
 
-TFB is a binary serialization format used within BroadLink's protocol.
-It is similar to a simplified BSON or MessagePack. Each TFB element
-consists of:
+Sent to/received from `<device_ip>:80` (unicast UDP):
 
 ```
-[Type: 1 byte] [Length: 1-2 bytes] [Value: variable]
+Offset  Size  Description
+──────  ────  ───────────────────
+0x00    2     Encrypted payload length (u16 LE, including 2-byte checksum prefix)
+0x02    2     Reserved (0x0000)
+0x04    4     Device type (u32 LE)
+0x08    2     Command type:
+                0x65 = Auth
+                0x03 = Login
+                0x06 = Device Info
+                0x6A = Device Control
+                0x6B = Device Status
+0x0A    2     Packet sequence count (monotonically increasing)
+0x0C    4     Device ID (u32 LE)
+0x10    6     MAC address (raw bytes, zero-padded to 8)
+0x18    4     Device ID copy
+0x1C    4     Timestamp (u32 LE, Unix epoch)
+0x20    4     Reserved / flags
+0x24    4     Reserved
+0x28    4     Reserved
+0x2C    4     Reserved
+──────────────────────────────────
+Header: 0x38 bytes (56 bytes)
+0x30    N     Encrypted payload (AES-128-CBC)
 ```
 
-### 5.2 Type Codes
+### 4.2 Command Types
 
-| Type | Code | Description |
-|------|------|-------------|
-| STRING | `0x00` | UTF-8 string, length-prefixed (2 bytes) |
-| INT | `0x01` | 32-bit integer, little-endian |
-| BOOL | `0x02` | Boolean (1 byte: 0x00 or 0x01) |
-| BYTES | `0x03` | Raw bytes, length-prefixed (2 bytes) |
-| ARRAY | `0x04` | Array, count-prefixed (2 bytes) |
-| MAP | `0x05` | Key-value map |
-| FLOAT | `0x06` | Float value |
+| Value | Name | Description |
+|-------|------|-------------|
+| `0x65` | Auth | Device authentication handshake |
+| `0x03` | Login | Cloud login (not used for local) |
+| `0x06` | Info | Get device information |
+| `0x6A` | Control | Send control command |
+| `0x6B` | Status | Query device status |
+
+### 4.3 Authentication Handshake
+
+```
+Client                                          Device
+  │                                                │
+  │ ─── CMD_AUTH (0x65) + 80 zero bytes ──────→   │
+  │                                                │
+  │ ←── Encrypted response with device ID ──────   │
+  │     (device ID extracted from header 0x0C)     │
+  │                                                │
+  │     IV = MD5(key + device_id_as_u32_le)        │
+  │                                                │
+  │ ─── Subsequent commands with derived IV ───→   │
+  │                                                │
+```
 
 ---
 
-## 6. Device Control Command Format
+## 5. Encryption Scheme
 
-### 6.1 JNI Function Signature
+### 5.1 Parameters
 
-```java
-// cn/com/broadlink/networkapi/NetworkAPI.smali
-public native String dnaControl(
-    String did,       // Device ID (34 hex chars)
-    String mac,       // MAC address (colon-separated)
-    String aesKey,    // AES-128 key (32 hex chars)
-    String password,  // Device password (decimal string) or sub-command
-    String command    // JSON command parameters
-);
-```
+- **Algorithm**: AES-128-CBC
+- **Key**: 16-byte device key (default: `097628343fe99e23765c1513accf8b02`)
+- **IV derivation**: `MD5(key || pack("<I", device_id))`
+- **Padding**: PKCS7
 
-### 6.2 Control Payload Structure
-
-The control payload is a TFB-encoded binary structure:
+### 5.2 Encryption Process
 
 ```
-Byte Offset  Size    Field
-──────────────────────────────────────
-0            17      Device ID (DID) — 17 bytes binary
-17           2       Sub-device ID (0x0000 for main device)
-19           1       Command Type byte:
-                       0x01 = Set control
-                       0x02 = Query status
-                       0x03 = Query capabilities
-20+          var     Parameter blocks (see below)
+1. Compute checksum: u16_le = sum(payload_bytes) & 0xFFFF
+2. Prepend: full_payload = pack("<H", checksum) + payload
+3. Pad: padded = PKCS7_pad(full_payload, 16)
+4. Encrypt: ciphertext = AES_CBC_ENCRYPT(key, iv, padded)
 ```
 
-### 6.3 Parameter Blocks
-
-Each parameter is a TLV (Type-Length-Value) block:
+### 5.3 Decryption Process
 
 ```
-[Param ID: 1 byte] [Length: 1 byte] [Value: variable]
+1. Decrypt: padded = AES_CBC_DECRYPT(key, iv, ciphertext)
+2. Unpad: full_payload = PKCS7_unpad(padded)
+3. Extract: checksum = unpack("<H", full_payload[:2])
+4. Verify: assert checksum == sum(full_payload[2:]) & 0xFFFF
+5. Return: full_payload[2:]
 ```
 
-| Param ID | Name | Length | Value |
-|----------|------|--------|-------|
-| `0x01` | Power | 1 | 0=OFF, 1=ON |
-| `0x02` | Mode | 1 | 0=COOL, 1=HEAT, 2=AUTO, 3=FAN, 4=DRY |
-| `0x03` | Temperature | 1 | 16-30 (Celsius) |
-| `0x04` | Fan Speed | 1 | 0=AUTO, 1=LOW, 2=MED, 3=HIGH |
-| `0x05` | Swing | 1 | 0=OFF, 1=VERT, 2=HORIZ, 3=BOTH |
-| `0x06` | Sleep | 1 | 0=OFF, 1=ON |
-| `0x07` | Turbo | 1 | 0=OFF, 1=ON |
-| `0x08` | Temp Unit | 1 | 0=Celsius, 1=Fahrenheit |
-| `0x09` | Room Temp | 1 | Room temperature (read-only) |
-| `0x0A` | Error Code | 1 | Error status |
-
-### 6.4 Status Response Structure
-
-Response uses the same parameter block encoding:
+### 5.4 Pseudocode
 
 ```python
-{
-    'power': True/False,
-    'mode': 0-4,
-    'temp': 16-30,
-    'fan': 0-3,
-    'swing': 0-3,
-    'sleep': True/False,
-    'turbo': True/False,
-    'room_temp': 0-50,     # Current room temperature
-    'error_code': 0,       # 0 = no error
+def broadlink_encrypt(payload, key, iv):
+    checksum = sum(payload) & 0xFFFF
+    plain = struct.pack("<H", checksum) + payload
+    padded = pkcs7_pad(plain, 16)
+    return aes_cbc_encrypt(key, iv, padded)
+
+def broadlink_decrypt(ciphertext, key, iv):
+    padded = aes_cbc_decrypt(key, iv, ciphertext)
+    plain = pkcs7_unpad(padded)
+    checksum_recv = struct.unpack("<H", plain[:2])[0]
+    payload = plain[2:]
+    assert checksum_recv == sum(payload) & 0xFFFF
+    return payload
+```
+
+---
+
+## 6. Network I/O Pattern (Callback-Based)
+
+All cloud/remote operations in the binary follow this identical pattern:
+
+```
+1. Acquire JNI read lock: FUN_0011ea10() → pthread_rwlock_rdlock
+2. Look up global callback ref from DATA table
+3. Convert C string param → JNI NewStringUTF
+4. Call Java callback: (*env)->CallObjectMethod(env, callback, method_id, ...)
+5. Get result: (*env)->GetStringUTFChars(env, result)
+6. Copy result to output buffer
+7. Release JNI read lock: FUN_0011eaf0() → pthread_rwlock_unlock
+```
+
+This pattern is used by `network_read_private_data`, `network_write_private_data`,
+`network_ac_ircode_operation`, `network_ircode_operation`, and `network_device_remote_control`.
+
+### 6.1 Java Callback Interface
+
+The callback flows are:
+
+```
+deviceProbe → network_device_probe → network_read_private_data → Java callback
+dnaControl  → networkapi_dna_control → (local UDP) or network_device_remote_control → Java callback
+bl_easyconfig → networkapi_device_easyconfig → SDK thread + UDP broadcast
+```
+
+---
+
+## 7. EasyConfig / SmartConfig Protocol
+
+### 7.1 Overview
+
+EasyConfig is Broadlink's proprietary WiFi provisioning protocol. The original
+binary sends UDP broadcast packets to port 49999 in a loop for a configurable
+timeout (default 75 seconds, max 150 seconds).
+
+### 7.2 Credential Payload
+
+```
+Offset  Size  Description
+──────  ────  ───────────────────
+0x00    5     Magic: "BLINK"
+0x05    1     SSID length
+0x06    32    SSID (null-padded)
+0x26    1     Password length
+0x27    64    Password (null-padded)
+0x67    1     Security type:
+                0 = Open
+                1 = WEP
+                2 = WPA
+                3 = WPA2
+                4 = WPA3
+0x68    1     Checksum (additive sum of bytes 0x00-0x67)
+──────────────────────────────────
+Total: 105 bytes
+```
+
+### 7.3 Timing
+
+The broadcast runs at approximately 10 packets per second for the duration of the
+timeout. Each packet is sent to `255.255.255.255:49999`.
+
+### 7.4 Cancellation
+
+`deviceEasyConfigCancel()` stops the broadcast by setting a flag checked by the
+packet-sending loop.
+
+---
+
+## 8. Internal Helper Functions
+
+### 8.1 `FUN_0011ea10` — Get JNI read lock
+
+```c
+// Acquires pthread_rwlock_rdlock, returns Java callback ref
+// Returns NULL if lock acquisition fails
+```
+
+### 8.2 `FUN_0011eaf0` — Release JNI read lock
+
+```c
+// Releases pthread_rwlock if it was acquired
+```
+
+### 8.3 `FUN_001cbf90` — Log helper
+
+```c
+// Internal logging: formats "[filename]:[line] [tag]" and prints via __android_log_print
+// Logs only if log_level ≥ configured level
+```
+
+### 8.4 `FUN_001d48f0` — Parse device info from JSON
+
+```c
+// Extracts MAC, IP, type, DID, key from a JSON object
+// Used by devicePair and dna_control
+```
+
+### 8.5 `FUN_001d0880` — Copy device context
+
+```c
+// Copies device authentication context (key, IV, MAC, type, DID, IP)
+// between internal structures
+```
+
+### 8.6 `FUN_001db970` — Parse sub-device info
+
+```c
+// Extracts sub-device information from JSON for multi-outlet devices (MP1)
+```
+
+---
+
+## 9. DNA Control Command Flow
+
+```
+dnaControl(deviceInfo, subDeviceInfo, data, command) {
+    1. Parse device_info JSON → MAC, IP, type, DID, key
+    2. Parse sub_device_info JSON (optional)
+    3. Parse data JSON → command type & parameters
+    4. Parse command JSON → additional parameters
+
+    IF localctrl == true AND IP present:
+        5a. Build Broadlink packet header
+        6a. Encrypt command payload with AES-128-CBC
+        7a. Send via UDP to device:80
+        8a. Receive response
+        9a. Decrypt response payload
+        10a. Format as JSON result
+
+    ELSE IF device_control_callback registered:
+        5b. Call Java callback with all 4 params
+        6b. Return callback result
+
+    ELSE:
+        Return error -4002 (no control path)
 }
 ```
 
-### 6.5 Example: Set Cooling to 22°C
+---
 
-```
-Control Payload (hex):
-  DID:      00000000000000000000a043b036bff4
-  SubDevID: 0000
-  CmdType:  01
-  Power:    01 01 01     (param=0x01, len=1, value=ON)
-  Mode:     02 01 00     (param=0x02, len=1, value=COOL)
-  Temp:     03 01 16     (param=0x03, len=1, value=22°C)
-  Fan:      04 01 00     (param=0x04, len=1, value=AUTO)
-  Swing:    05 01 03     (param=0x05, len=1, value=BOTH)
+## 10. Error Codes
 
-Full payload: 00000000000000000000a043b036bff4000001010101020100030116040100050103
-```
+| Code | Name | Description |
+|------|------|-------------|
+| `0` | Success | Operation completed successfully |
+| `-1` | Generic Error | Catch-all for exceptions |
+| `-4000` | Invalid JSON | Input string is not valid JSON |
+| `-4001` | Invalid Type | Field has wrong type (e.g. string instead of number) |
+| `-4002` | No Path | No local IP and no cloud callback available |
+| `-4006` | Auth Failed | Device authentication handshake failed |
+| `-4008` | Too Long | String exceeds maximum length (e.g. filepath > 384) |
+| `-4018` | JSON Create Fail | Failed to allocate/construct JSON object (malloc failure) |
 
 ---
 
-## 7. Device Discovery
+## 11. Version String
 
-### 7.1 Broadcast Probe
-
-Send a UDP broadcast to port 80:
+The library reports its version as:
 
 ```
-DNA Packet:
-  Magic:   5a a5
-  Length:  06 00  (6 bytes: 4 payload + 2 checksum)
-  Command: 00 01  (DEVICE_DISCOVER)
-  Payload: 00 00 00 00  (zero-filled probe)
-  Checksum: 00 00
+"2.0.49-6566c07"
 ```
 
-### 7.2 Discovery Response
+With optional `.local` suffix when `localctrl` is enabled:
 
 ```
-Payload:
-  [MAC: 6 bytes]
-  [IP: 4 bytes]
-  [DID: 17 bytes]
-  [Name: UTF-8 string (variable)]
+"2.0.49-6566c07.local"
 ```
+
+The hardcoded source paths in debug strings reveal the origin:
+- `/Users/admin/Work/Broadlink/Gitlab/DNASDK/linux/src/networkapi_command.c`
 
 ---
 
-## 8. Known Device Types
+## 12. BLJSON (cJSON Fork)
 
-| devtype | PID | Product |
-|---------|-----|---------|
-| 20379 (`0x4F9B`) | `...9b4f0000` | Kelvinator/Electrolux AC (Wi-Fi) |
+The library bundles a modified version of cJSON under the prefix `BLJSON`:
 
-The devtype `0x4F9B` corresponds to the product code `9b4f` (little-endian byte order).
-
----
-
-## 9. Internal Library Architecture
-
-### 9.1 Function Call Graph
-
-```
-Java: NetworkAPI.dnaControl(did, mac, aesKey, password, command)
-  │
-  ▼
-JNI: Java_cn_com_broadlink_networkapi_NetworkAPI_dnaControl
-  │
-  ├─→ JSON parse (BLJSON_Parse)
-  ├─→ networkapi_dna_control()
-  │     │
-  │     ├─→ Validate parameters
-  │     ├─→ Build TFB payload
-  │     │     └─→ bl_sdk_tfb_encode()
-  │     ├─→ Encrypt payload
-  │     │     └─→ bl_data_tfb_encrypt()
-  │     │           ├─→ password XOR
-  │     │           └─→ broadlink_cipher_crypt (AES-128-ECB)
-  │     ├─→ Build DNA packet
-  │     │     └─→ bl_data_pack()
-  │     │           ├─→ Add header (magic, length, command)
-  │     │           └─→ bl_tfb_checksum() / bl_checksum()
-  │     ├─→ Send via UDP socket
-  │     ├─→ Receive response
-  │     ├─→ Parse DNA packet
-  │     ├─→ Decrypt payload
-  │     │     └─→ bl_data_tfb_decrypt()
-  │     └─→ Decode TFB response
-  │           └─→ bl_sdk_tfb_decode()
-  │
-  ▼
-Returns: JSON response string (jstring)
-```
-
-### 9.2 Memory Map
-
-Loadable segments from libNetworkAPI.so (Ghidra analysis):
-- `.text`: `0x187b0 - 0x1b82f` (core code)
-- `.text`: `0x1b830 - 0xff800` (main code, ~915KB)
-- `.data`: various
-- `.rodata`: `0x110198 - 0x120003`
-- `.dynamic`: `0x128448 - 0x128697`
-- `.bss`: `0x132c80 - 0x135081`
+| Function | cJSON Equivalent |
+|----------|-----------------|
+| `BLJSON_Parse` | `cJSON_Parse` |
+| `BLJSON_PrintUnformatted` | `cJSON_PrintUnformatted` |
+| `BLJSON_CreateObject` | `cJSON_CreateObject` |
+| `BLJSON_CreateArray` | `cJSON_CreateArray` |
+| `BLJSON_CreateString` | `cJSON_CreateString` |
+| `BLJSON_CreateNumber` | `cJSON_CreateNumber` |
+| `BLJSON_AddItemToObject` | `cJSON_AddItemToObject` |
+| `BLJSON_GetObjectItem` | `cJSON_GetObjectItem` |
+| `BLJSON_Delete` | `cJSON_Delete` |
+| `BLJSON_GetErrorPtr` | `cJSON_GetErrorPtr` |
+| `BLJSON_InitHooks` | `cJSON_InitHooks` |
 
 ---
 
-## 10. Security Considerations
+## 13. Thread Safety
 
-1. **AES-ECB is weak**: ECB mode does not provide semantic security.
-   Identical plaintext blocks produce identical ciphertext blocks.
+The library uses a single `pthread_rwlock_t` stored at offset 0 of the global context
+(`0x00228698`). All operations that access shared state (callbacks, config, device list)
+acquire this lock.
 
-2. **Static keys**: Each device has a static AES key retrieved from the
-   cloud. If the cloud account is compromised, all device keys are exposed.
-
-3. **Password XOR is deterministic**: The password-based XOR before
-   encryption adds minimal security.
-
-4. **No replay protection**: DNA packets lack timestamps or nonces,
-   making them potentially vulnerable to replay attacks.
-
-5. **UDP without integrity**: While the checksum provides basic integrity,
-   there is no cryptographic MAC (Message Authentication Code).
-
----
-
-## 11. References
-
-- BroadLink DNA SDK (commercial, requires NDA)
-- [python-broadlink](https://github.com/mjg59/python-broadlink) — Open-source
-  BroadLink protocol implementation
-- [Home Assistant BroadLink integration](https://www.home-assistant.io/integrations/broadlink/)
-- Ghidra: `libNetworkAPI.so` analysis (this project)
-- MITM proxy flows: `tools/flows` (this project)
+- **Read lock**: Callback invocations, config reads
+- **Write lock**: SDK initialization, callback registration
